@@ -1,298 +1,304 @@
 import discord
-from discord.ext import commands
-import os, json
-from datetime import datetime, timedelta, timezone
-from flask import Flask
-import threading
+from discord import app_commands
+import sqlite3
+from datetime import datetime, timedelta
+import requests
+from bs4 import BeautifulSoup
+import os
 
-# ===================== CONFIG =====================
-DATA_FILE = "trades.json"
-TOKEN = os.getenv("DISCORD_TOKEN")
+def init_db():
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades
+                 (id INTEGER PRIMARY KEY, user_id INTEGER, timestamp TEXT, entry REAL, sl REAL, tp REAL, exit REAL, 
+                  profit REAL, rr REAL, is_win INTEGER, is_archived INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS reset_stats
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, reset_date TEXT, wins INTEGER, 
+                  losses INTEGER, total_profit REAL, avg_rr REAL)''')
+    conn.commit()
+    conn.close()
 
-# ===================== DATA HELPERS =====================
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+class MyClient(discord.Client):
+    def __init__(self, *, intents: discord.Intents):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    async def setup_hook(self):
+        self.tree.sync()
 
-trade_data = load_data()
+client = MyClient(intents=discord.Intents.default())
 
-def ensure_user(uid):
-    if uid not in trade_data:
-        trade_data[uid] = {"trades": []}
-
-def log_trade(uid, record):
-    ensure_user(uid)
-    trade_data[uid]["trades"].append(record)
-    save_data(trade_data)
-
-# ===================== DISCORD BOT =====================
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix=["!", "/"], intents=intents)
-
-# ===================== KEEP ALIVE =====================
-app = Flask("")
-
-@app.route("/")
-def home():
-    return "TradeBot is vibin'!"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run_web)
-    t.start()
-
-# ===================== UTILS =====================
-def compute_rr(entry, sl, tp):
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    if risk == 0: return 0.0
-    return round(reward / risk, 2)
-
-def filter_trades(trades, period):
-    now = datetime.now(timezone.utc)
-    if period == "daily":
-        cutoff = now - timedelta(days=1)
-    elif period == "weekly":
-        cutoff = now - timedelta(days=7)
-    elif period == "monthly":
-        cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    else:
-        return trades
-    return [t for t in trades if datetime.fromisoformat(t["timestamp"]) > cutoff]
-
-def stats_summary(trades):
-    total = len(trades)
-    wins = sum(1 for t in trades if t["result"] == "tp")
-    losses = sum(1 for t in trades if t["result"] == "sl")
-    neutral = total - wins - losses
-    total_rr = sum(t["rr"] for t in trades)
-    avg_rr = (total_rr / total) if total > 0 else 0.0
-    win_rate = (wins / (total - neutral) * 100) if (total - neutral) > 0 else 0.0
-    return total, wins, losses, neutral, total_rr, avg_rr, win_rate
-
-# ===================== COMMANDS =====================
-@bot.event
+@client.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f'Logged in as {client.user}')
 
-@bot.command()
-async def ping(ctx):
-    await ctx.send("🏓 Boing! I'm alive and kickin'!")
+# Helper to get economic calendar
+def get_economic_calendar():
+    try:
+        url = "https://www.investing.com/economic-calendar/"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        events = []
+        table = soup.find('table', id='economicCalendarData')
+        if table:
+            rows = table.find_all('tr', class_='js-event-item')
+            for row in rows:
+                time = row.find('td', class_='time').text.strip()
+                currency = row.find('td', class_='flagCur').text.strip()
+                impact = row.find('td', class_='sentiment').get('data-img_key', '').replace('bull', 'Impact ')
+                event = row.find('td', class_='event').text.strip()
+                events.append(f"{time} {currency} {impact}: {event}")
+        return events[:10] if events else ["No events found."]
+    except Exception:
+        return ["Unable to fetch calendar at this time."]
 
-@bot.command()
-async def help(ctx):
-    text = """
-🎉 **TradeBot — Your Trading Sidekick!**
-Prefix with `!`, `/`, or `#`.
-
-➕ **Log a Trade**
-!trade <pair> <buy/sell> <entry> <sl> <tp> <tp/sl/none>
-
-📊 **Check Your Game**
-!stats → All-time glory
-!dailystats / !weeklystats / !monthlystats
-
-🏆 **Show Off**
-!leaderboard → Top traders
-!besttrade / !worsttrade
-!streak → Win streak vibes
-
-🛠 **Tweak It**
-!removelasttrade
-!resetstats (yours) or !resetstats all (admin only)
-
-📅 **Time Travel**
-!calendar → Trade timeline
-"""
-    await ctx.send(text)
-
-@bot.command()
-async def trade(ctx, pair: str, direction: str, entry: float, sl: float, tp: float, result: str):
-    direction = direction.lower()
-    result = result.lower()
-    if direction not in ("buy", "sell") or result not in ("tp", "sl", "none"):
-        await ctx.send("❌ Whoops! Try: !trade xauusd buy 3300 3290 3330 tp/sl/none")
+# Command: /trade
+@client.tree.command(name="trade", description="Log a completed trade with RR calculation")
+@app_commands.describe(entry="Entry price", sl="Stop loss", tp="Take profit", exit="Exit price")
+async def trade_command(interaction: discord.Interaction, entry: float, sl: float, tp: float, exit: float):
+    if entry <= sl or tp <= entry:
+        await interaction.response.send_message("Invalid trade parameters (assuming long position).")
         return
+    rr = (tp - entry) / (entry - sl) if (entry - sl) != 0 else 0
+    profit = exit - entry
+    is_win = 1 if profit > 0 else 0
+    timestamp = datetime.now().isoformat()
+    user_id = interaction.user.id
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO trades (user_id, timestamp, entry, sl, tp, exit, profit, rr, is_win) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              (user_id, timestamp, entry, sl, tp, exit, profit, rr, is_win))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"Trade logged! RR: {rr:.2f}, Profit: {profit:.2f}, Win: {'Yes' if is_win else 'No'}")
 
-    rr_val = compute_rr(entry, sl, tp)
-    rr_signed = rr_val if result == "tp" else -rr_val if result == "sl" else 0.0
-
-    record = {
-        "pair": pair,
-        "dir": direction,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "result": result,
-        "rr": rr_signed,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-    user_id = str(ctx.author.id)
-    log_trade(user_id, record)
-
-    await ctx.send(f"🎉 Nice one! {pair.upper()} {direction.upper()} is logged 🎉 RR: {rr_signed:+.2f} 🚀 "
-                   f"(TP {'reached' if result == 'tp' else 'not reached' if result == 'none' else 'missed'}!)")
-
-def build_stats_table(ctx, trades, title):
-    total, wins, losses, neutral, total_rr, avg_rr, win_rate = stats_summary(trades)
-    table = f"**{ctx.author.name} — {title}**\n" \
-            f"| Metric         | Value         |\n" \
-            f"|---------------:|---------------|\n" \
-            f"| Trades         | {total}        |\n" \
-            f"| Wins           | {wins}         |\n" \
-            f"| Losses         | {losses}       |\n" \
-            f"| Neutral        | {neutral}      |\n" \
-            f"| Total RR       | {total_rr:+.2f}    |\n" \
-            f"| Avg RR         | {avg_rr:.2f}   |\n" \
-            f"| Win Rate       | {win_rate:.1f}%  |"
-    return table
-
-@bot.command()
-async def stats(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
+# Command: /tradingjournal
+@client.tree.command(name="tradingjournal", description="View your recent trades")
+async def tradingjournal(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT timestamp, entry, exit, profit, rr FROM trades WHERE user_id=? ORDER BY timestamp DESC LIMIT 10", (user_id,))
+    trades = c.fetchall()
+    conn.close()
     if not trades:
-        await ctx.send("📊 No trades yet, champ! Start logging!")
+        await interaction.response.send_message("No trades found.")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Lifetime Stats"))
+    response = "Recent Trades:\n" + "\n".join([f"{t[0]}: Entry {t[1]}, Exit {t[2]}, Profit {t[3]:.2f}, RR {t[4]:.2f}" for t in trades])
+    await interaction.response.send_message(response)
 
-@bot.command()
-async def dailystats(ctx):
-    user_id = str(ctx.author.id)
-    trades = filter_trades(trade_data.get(user_id, {}).get("trades", []), "daily")
-    if not trades:
-        await ctx.send("📊 No trades in the last 24h, huh?")
+# Command: /besttrade
+@client.tree.command(name="besttrade", description="View your best trade by profit")
+async def besttrade(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT timestamp, entry, exit, profit, rr FROM trades WHERE user_id=? ORDER BY profit DESC LIMIT 1", (user_id,))
+    trade = c.fetchone()
+    conn.close()
+    if not trade:
+        await interaction.response.send_message("No trades found.")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Daily Stats"))
+    await interaction.response.send_message(f"Best Trade: {trade[0]} - Entry {trade[1]}, Exit {trade[2]}, Profit {trade[3]:.2f}, RR {trade[4]:.2f}")
 
-@bot.command()
-async def weeklystats(ctx):
-    user_id = str(ctx.author.id)
-    trades = filter_trades(trade_data.get(user_id, {}).get("trades", []), "weekly")
-    if not trades:
-        await ctx.send("📊 Quiet week? No trades yet!")
+# Command: /worsttrade
+@client.tree.command(name="worsttrade", description="View your worst trade by profit")
+async def worsttrade(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT timestamp, entry, exit, profit, rr FROM trades WHERE user_id=? ORDER BY profit ASC LIMIT 1", (user_id,))
+    trade = c.fetchone()
+    conn.close()
+    if not trade:
+        await interaction.response.send_message("No trades found.")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Weekly Stats"))
+    await interaction.response.send_message(f"Worst Trade: {trade[0]} - Entry {trade[1]}, Exit {trade[2]}, Profit {trade[3]:.2f}, RR {trade[4]:.2f}")
 
-@bot.command()
-async def monthlystats(ctx):
-    user_id = str(ctx.author.id)
-    trades = filter_trades(trade_data.get(user_id, {}).get("trades", []), "monthly")
-    if not trades:
-        await ctx.send("📊 No trades this month, time to shine!")
-        return
-    await ctx.send(build_stats_table(ctx, trades, "Monthly Stats"))
+# Command: /calendar
+@client.tree.command(name="calendar", description="View upcoming economic calendar events")
+async def calendar(interaction: discord.Interaction):
+    events = get_economic_calendar()
+    response = "Economic Calendar (Top 10):\n" + "\n".join(events)
+    await interaction.response.send_message(response)
 
-@bot.command()
-async def leaderboard(ctx):
-    scores = []
-    for uid, udata in trade_data.items():
-        total_rr = sum(t["rr"] for t in udata["trades"])
-        scores.append((uid, total_rr))
-    scores.sort(key=lambda x: x[1], reverse=True)
-    text = "🏆 **Leaderboard of Legends!**\n"
-    for i, (uid, rr) in enumerate(scores[:5], 1):
-        user = await bot.fetch_user(int(uid))
-        trophy = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🎖️"
-        text += f"{i}. {trophy} {user.name} — {rr:+.2f} RR\n"
-    await ctx.send(text)
+# Helper for stats
+def get_stats(user_id, start_time=None, archived=False):
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    where = "user_id=?" 
+    params = [user_id]
+    if not archived:
+        where += " AND is_archived=0"
+    if start_time:
+        where += " AND timestamp >= ?"
+        params.append(start_time)
+    c.execute(f"SELECT COUNT(*) FROM trades WHERE {where}", params)
+    total = c.fetchone()[0]
+    c.execute(f"SELECT COUNT(*) FROM trades WHERE {where} AND is_win=1", params)
+    wins = c.fetchone()[0]
+    losses = total - wins
+    c.execute(f"SELECT SUM(profit) FROM trades WHERE {where}", params)
+    total_profit = c.fetchone()[0] or 0
+    c.execute(f"SELECT AVG(rr) FROM trades WHERE {where}", params)
+    avg_rr = c.fetchone()[0] or 0
+    conn.close()
+    return wins, losses, total_profit, avg_rr
 
-@bot.command()
-async def removelasttrade(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
-    if not trades:
-        await ctx.send("❌ No trades to zap! Log one first.")
-        return
-    last = trades.pop()
-    save_data(trade_data)
-    await ctx.send(f"⏪ Trade removed! {last['pair']} {last['dir']} RR {last['rr']:+.2f}\n✓ Data saved.")
+# Command: /dailystats
+@client.tree.command(name="dailystats", description="View today's stats")
+async def dailystats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    start = datetime.now().replace(hour=0, minute=0, second=0).isoformat()
+    wins, losses, total_profit, avg_rr = get_stats(user_id, start)
+    await interaction.response.send_message(f"Daily Stats: Wins {wins}, Losses {losses}, Profit {total_profit:.2f}, Avg RR {avg_rr:.2f}")
 
-@bot.command()
-async def besttrade(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
-    if not trades:
-        await ctx.send("❌ No trades to brag about!")
-        return
-    best = max(trades, key=lambda t: t["rr"])
-    await ctx.send(f"🌟 **GLORIOUS VICTORY!** {best['pair']} {best['dir']} RR {best['rr']:+.2f}")
+# Command: /weeklystats
+@client.tree.command(name="weeklystats", description="View this week's stats")
+async def weeklystats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    start = (datetime.now() - timedelta(days=7)).isoformat()
+    wins, losses, total_profit, avg_rr = get_stats(user_id, start)
+    await interaction.response.send_message(f"Weekly Stats: Wins {wins}, Losses {losses}, Profit {total_profit:.2f}, Avg RR {avg_rr:.2f}")
 
-@bot.command()
-async def worsttrade(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
-    if not trades:
-        await ctx.send("❌ No trades to mourn!")
-        return
-    worst = min(trades, key=lambda t: t["rr"])
-    await ctx.send(f"💀 **OUCH! EPIC FAIL!** {worst['pair']} {worst['dir']} RR {worst['rr']:+.2f}")
+# Command: /monthlystats
+@client.tree.command(name="monthlystats", description="View this month's stats")
+async def monthlystats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    start = (datetime.now() - timedelta(days=30)).isoformat()
+    wins, losses, total_profit, avg_rr = get_stats(user_id, start)
+    await interaction.response.send_message(f"Monthly Stats: Wins {wins}, Losses {losses}, Profit {total_profit:.2f}, Avg RR {avg_rr:.2f}")
 
-@bot.command()
-async def streak(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
-    if not trades:
-        await ctx.send("📊 No trades for a streak!")
-        return
-    streak = 0
-    for t in reversed(trades):
-        if t["result"] == "tp": streak += 1
-        else: break
-    await ctx.send(f"🔥 **WIN STREAK ALERT!** {streak} in a row!")
+# Command: /stats
+@client.tree.command(name="stats", description="View current period stats")
+async def stats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    wins, losses, total_profit, avg_rr = get_stats(user_id)
+    await interaction.response.send_message(f"Current Stats: Wins {wins}, Losses {losses}, Profit {total_profit:.2f}, Avg RR {avg_rr:.2f}")
 
-@bot.command()
-async def resetstats(ctx, arg=None):
-    user_id = str(ctx.author.id)
-    if arg == "all":
-        if ctx.author.guild_permissions.administrator:
-            await ctx.send("⚠️ Confirm reset all with `!resetstats confirm` or `/resetstats confirm`\n✓ Admin check passed.")
-            return
-        else:
-            await ctx.send("❌ Only admins can reset all stats!")
-            return
-    if arg == "confirm" and ctx.author.guild_permissions.administrator:
-        trade_data.clear()
-        save_data(trade_data)
-        await ctx.send("✅ All stats wiped! Fresh start for everyone.\n✓ Data saved.")
-        return
-    trade_data[user_id] = {"trades": []}
-    save_data(trade_data)
-    await ctx.send("✅ Your stats are reset! New beginning.\n✓ Data saved.")
+# Command: /lifetimestats
+@client.tree.command(name="lifetimestats", description="View lifetime stats")
+async def lifetimestats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    wins, losses, total_profit, avg_rr = get_stats(user_id, archived=True)
+    await interaction.response.send_message(f"Lifetime Stats: Wins {wins}, Losses {losses}, Profit {total_profit:.2f}, Avg RR {avg_rr:.2f}")
 
-@bot.command()
-async def calendar(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
-    if not trades:
-        await ctx.send("📅 No trade history to tell!")
-        return
-    trades_by_day = {}
+# Command: /streak
+@client.tree.command(name="streak", description="View current win streak")
+async def streak(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT is_win FROM trades WHERE user_id=? AND is_archived=0 ORDER BY timestamp DESC", (user_id,))
+    trades = c.fetchall()
+    conn.close()
+    current_streak = 0
     for t in trades:
-        d = datetime.fromisoformat(t["timestamp"]).strftime("%Y-%m-%d")
-        trades_by_day.setdefault(d, []).append(t)
-    text = "📖 **Trade Adventure Log**\n"
-    for d, ts in trades_by_day.items():
-        total_rr = sum(x["rr"] for x in ts)
-        text += f"On {d}, you rocked {len(ts)} trades with a total RR of {total_rr:+.2f}!\n"
-    await ctx.send(text)
+        if t[0] == 1:
+            current_streak += 1
+        else:
+            break
+    await interaction.response.send_message(f"Current Win Streak: {current_streak}")
 
-# ===================== RUN =====================
+# Command: /leaderboard
+@client.tree.command(name="leaderboard", description="View top users by lifetime profit")
+async def leaderboard(interaction: discord.Interaction):
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id, SUM(profit) as total FROM trades GROUP BY user_id ORDER BY total DESC LIMIT 5")
+    tops = c.fetchall()
+    conn.close()
+    if not tops:
+        await interaction.response.send_message("No leaderboard data.")
+        return
+    response = "Leaderboard (Top 5 by Profit):\n"
+    for i, (uid, total) in enumerate(tops, 1):
+        user = await client.fetch_user(uid)
+        response += f"{i}. {user.name}: {total:.2f}\n"
+    await interaction.response.send_message(response)
+
+# Command: /resetstats
+@client.tree.command(name="resetstats", description="Reset current stats (archives trades)")
+async def resetstats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    wins, losses, total_profit, avg_rr = get_stats(user_id)
+    if wins + losses == 0:
+        await interaction.response.send_message("No current trades to reset.")
+        return
+    reset_date = datetime.now().isoformat()
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO reset_stats (user_id, reset_date, wins, losses, total_profit, avg_rr) VALUES (?, ?, ?, ?, ?, ?)",
+              (user_id, reset_date, wins, losses, total_profit, avg_rr))
+    c.execute("UPDATE trades SET is_archived=1 WHERE user_id=? AND is_archived=0", (user_id,))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("Stats reset! Previous stats archived.")
+
+# Command: /previousresetstats
+@client.tree.command(name="previousresetstats", description="View stats from previous reset")
+async def previousresetstats(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT wins, losses, total_profit, avg_rr FROM reset_stats WHERE user_id=? ORDER BY reset_date DESC LIMIT 1", (user_id,))
+    stats = c.fetchone()
+    conn.close()
+    if not stats:
+        await interaction.response.send_message("No previous reset found.")
+        return
+    await interaction.response.send_message(f"Previous Reset: Wins {stats[0]}, Losses {stats[1]}, Profit {stats[2]:.2f}, Avg RR {stats[3]:.2f}")
+
+# Command: /allresetstats (admin only)
+@client.tree.command(name="allresetstats", description="View all reset stats (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def allresetstats(interaction: discord.Interaction):
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id, reset_date, wins, losses, total_profit FROM reset_stats ORDER BY reset_date DESC")
+    all_resets = c.fetchall()
+    conn.close()
+    if not all_resets:
+        await interaction.response.send_message("No reset stats found.")
+        return
+    response = "All Reset Stats:\n"
+    for uid, date, wins, losses, profit in all_resets[:20]:  # Limit to 20 for message size
+        user = await client.fetch_user(uid)
+        response += f"{user.name} ({date}): Wins {wins}, Losses {losses}, Profit {profit:.2f}\n"
+    await interaction.response.send_message(response)
+
+# Command: /ping
+@client.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
+    latency = round(client.latency * 1000)
+    await interaction.response.send_message(f"Pong! Latency: {latency}ms")
+
+# Command: /help
+@client.tree.command(name="help", description="List all commands")
+async def help_command(interaction: discord.Interaction):
+    commands_list = [
+        "/trade: Log a trade",
+        "/tradingjournal: View recent trades",
+        "/besttrade: Best trade",
+        "/worsttrade: Worst trade",
+        "/calendar: Economic calendar",
+        "/dailystats: Daily stats",
+        "/weeklystats: Weekly stats",
+        "/monthlystats: Monthly stats",
+        "/stats: Current stats",
+        "/lifetimestats: Lifetime stats",
+        "/streak: Win streak",
+        "/leaderboard: Top users",
+        "/resetstats: Reset current stats",
+        "/previousresetstats: Previous reset stats",
+        "/allresetstats: All resets (admin)",
+        "/ping: Bot latency",
+        "/help: This list"
+    ]
+    response = "Available Commands:\n" + "\n".join(commands_list)
+    await interaction.response.send_message(response)
+
 if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ Set DISCORD_TOKEN in Replit Secrets.")
-    else:
-        keep_alive()
-        bot.run(TOKEN)
+    init_db()
+    client.run(os.environ['DISCORD_TOKEN'])
